@@ -49,10 +49,18 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 import pywt
 from scipy import stats
+from matplotlib.gridspec import GridSpec
 
-from PyEMD import CEEMDAN
+try:
+    # Provided by PyPI package: EMD-signal
+    #   pip install EMD-signal
+    from PyEMD import CEEMDAN
+except Exception as e:  # pragma: no cover
+    CEEMDAN = None  # type: ignore
+    _CEEMDAN_IMPORT_ERROR = e
 
 # Optional progress bars
 try:
@@ -76,6 +84,68 @@ plt.rcParams.update(
         "grid.alpha": 0.25,
     }
 )
+
+
+# -----------------------------
+# Consistent colour palette
+# -----------------------------
+# Use Matplotlib's default colour cycle (C0..C9) but name key series so
+# colours are consistent across all figures.
+COL = {
+    "naive": "C0",
+    "censored": "C1",
+    "ceemdan": "C2",
+    "baseline": "C3",
+    "events": "C4",
+    "band_event": "C0",
+    "band_baseline": "C1",
+    "obs_weekly": "0.25",  # dark gray
+    "obs_daily": "0.55",  # light gray
+}
+
+
+# ----------------------------- Plot + output settings -----------------------------
+# Toggle legacy CWT outputs (the three separate CWT figures). Requested default: False.
+SAVE_CWT_LEGACY = False
+
+# Colormap for the CWT log-power heatmap
+CWT_CMAP = "viridis"
+
+# Colour limits for CWT log10(power).
+# If CWT_CLIM is not None, use (vmin, vmax). Otherwise use percentiles from the data.
+CWT_CLIM = None  # e.g. (-2.5, 3.2)
+CWT_CLIM_PERCENTILES = (2.0, 98.0)
+
+# Mask non-significant regions in the wavelet heatmap (power below 95% red-noise threshold)
+CWT_MASK_NONSIGNIFICANT = True
+# How masked (non-significant) cells are rendered in the heatmap (RGBA). Use alpha=0 for transparent.
+CWT_MASK_BAD_RGBA = (0.0, 0.0, 0.0, 0.0)
+
+# Period guide lines drawn on wavelet panels (days)
+PERIOD_GUIDES_DAYS = (7.0, 30.0, 365.0)
+PERIOD_GUIDE_STYLE = dict(color="white", linestyle=":", linewidth=1.0, alpha=0.7)
+
+# HF period rendering in plots: use two vertical dashed lines (no shaded span)
+HF_MARKER = dict(color="white", linestyle="--", linewidth=1.2, alpha=0.95)
+
+HF_SPAN = dict(color="lightsteelblue", alpha=0.12, zorder=0)
+
+# Colourbar styling for inset colourbar drawn on top of the heatmap
+CWT_COLORBAR = dict(
+    width="38%",      # relative to heatmap axes
+    height="3.0%",      # relative to heatmap axes
+    loc="upper center",
+    borderpad=1.0,
+    label="log10(power)",
+    tick_color="white",
+    label_color="white",
+    outline_color="white",
+)
+
+
+
+HF_START = pd.Timestamp("2000-01-01")
+HF_END = pd.Timestamp("2005-12-31")
 
 
 def _now() -> str:
@@ -223,6 +293,11 @@ def ceemdan_decompose(
     noise_width: float = 0.2,
     progress: bool = False,
 ) -> np.ndarray:
+    if CEEMDAN is None:
+        raise ImportError(
+            "CEEMDAN requires the 'EMD-signal' package (module 'PyEMD'). "
+            "Install with: pip install EMD-signal"
+        ) from _CEEMDAN_IMPORT_ERROR
     ce = CEEMDAN()
     ce.noise_seed(int(seed))
     ce.trials = int(trials)
@@ -431,6 +506,36 @@ def save_fig(path: Path):
     plt.close()
 
 
+def mark_hf_period(ax, start, end, *, label=None, zorder=10):
+    """Mark the HF window using two vertical dashed lines (high-contrast on the heatmap)."""
+    ax.axvline(mdates.date2num(start), label=label, zorder=zorder, **HF_MARKER)
+    ax.axvline(mdates.date2num(end), zorder=zorder, **HF_MARKER)
+
+def mark_hf_span(ax, start, end, *, label=None, zorder=0):
+    """Mark the HF window on standard (non-heatmap) plots using a shaded span."""
+    kw = dict(HF_SPAN)
+    # Avoid passing zorder twice (matplotlib raises TypeError).
+    kw["zorder"] = zorder
+    ax.axvspan(start, end, label=label, **kw)
+
+
+
+
+
+def add_hf_label_in_heatmap(ax, start, end, *, y_period=2.5, x_pos=None, text="HF period"):
+    """Add a small dashed guide + label inside the heatmap in data coordinates.
+
+    This avoids a standard legend box, which can be unreadable over high-power regions.
+    """
+    x0 = mdates.date2num(start)
+    x1 = mdates.date2num(end)
+    if x_pos is None:
+        x_pos = x0 + 0.02 * (x1 - x0)  # slightly inside the HF window
+    # short horizontal dashed segment as a key
+    seg = 0.10 * (x1 - x0)
+    ax.plot([x_pos, x_pos + seg], [y_period, y_period], **HF_MARKER, zorder=15)
+    ax.text(x_pos + 1.15 * seg, y_period, text, color="white", va="center", ha="left", zorder=15)
+
 # -----------------------------
 # Torrence & Compo-style wavelet significance + cone of influence (approximate)
 # -----------------------------
@@ -453,8 +558,18 @@ def wavelet_significance_ar1(
     dt_days: float = 1.0,
     p: float = 0.95,
     dof: float = 2.0,
-) -> tuple[np.ndarray, float]:
-    """Scale-dependent significance threshold for wavelet power vs AR(1) red-noise (approx.)."""
+) -> tuple[np.ndarray, np.ndarray, float]:
+    """Scale-dependent red-noise background and significance threshold for wavelet power.
+
+    Returns
+    -------
+    signif : ndarray
+        Scale-dependent 95% (or p) significance threshold (same units as power).
+    background : ndarray
+        AR(1) red-noise background spectrum (same units as power).
+    alpha : float
+        Estimated AR(1) lag-1 coefficient.
+    """
     x = np.asarray(x, dtype=float)
     x = x[np.isfinite(x)]
     variance = float(np.var(x, ddof=0))
@@ -468,7 +583,7 @@ def wavelet_significance_ar1(
 
     chi2_thr = float(chi2.ppf(p, dof) / dof)
     signif = background * chi2_thr
-    return signif, alpha
+    return signif, background, alpha
 
 
 def cone_of_influence_period(
@@ -560,7 +675,7 @@ def main(
         label="censored monthly CI",
     )
 
-    hf_months = (monthly_naive.index >= "2000-01-31") & (monthly_naive.index <= "2005-12-31")
+    hf_months = (monthly_naive.index >= HF_START) & (monthly_naive.index <= HF_END)
     bias = monthly_naive["Mean"] - monthly_censored["Mean"]
     bias_hf_mean = float(np.nanmean(bias[hf_months].to_numpy()))
 
@@ -625,10 +740,16 @@ def main(
         vmax = float(np.nanquantile(log_power, 0.995))
 
         years = t.year + (t.dayofyear - 1) / 365.0
+        x_num = mdates.date2num(t.to_pydatetime())
 
-        # (1) Log-power heatmap with overlays + 95% red-noise significance + COI
-        signif, ar1 = wavelet_significance_ar1(x, period_days, dt_days=dt_days, p=0.95, dof=2.0)
+        # Red-noise diagnostics (AR1 background + 95% significance)
+        signif, background, ar1 = wavelet_significance_ar1(x, period_days, dt_days=dt_days, p=0.95, dof=2.0)
         signif_log = np.log10(signif + 1e-12)[:, None]
+
+        # Optionally mask non-significant power (below 95% red-noise threshold)
+        plot_log_power = log_power
+        if CWT_MASK_NONSIGNIFICANT:
+            plot_log_power = np.where(log_power < signif_log, np.nan, log_power)
 
         coi_period = cone_of_influence_period(len(t), dt_days=dt_days, omega0=6.0)
         
@@ -636,55 +757,7 @@ def main(
         coi_period = np.clip(coi_period, period_days.min(), period_days.max())                
         #coi_period = np.maximum(coi_period, period_days.min())
 
-        fig, ax = plt.subplots(figsize=(12, 6))
-        pcm = ax.pcolormesh(
-            years,
-            period_days,
-            log_power,
-            shading="auto",
-            vmin=vmin,
-            vmax=vmax,
-        )
-        cbar = fig.colorbar(pcm, ax=ax)
-        cbar.set_label("log10(power)")
-
-        X, Y = np.meshgrid(years, period_days)
-        ax.contour(X, Y, log_power - signif_log, levels=[0.0], linewidths=0.9)
-
-        ax.axvspan(2000.0, 2006.0, alpha=0.12, label="HF period")
-
-        if "det_event_mask" in df_daily.columns:
-            evt = df_daily.loc["1998":"2007", "det_event_mask"]
-            evt_times = evt.index[evt.values.astype(bool)]
-            evt_years = evt_times.year + (evt_times.dayofyear - 1) / 365.0
-            for yy in evt_years:
-                ax.axvline(float(yy), lw=0.25, alpha=0.18)
-
-        ax.plot(years, coi_period, color="white", lw=1.0)
-        ax.fill_between(years, coi_period, period_days.max(), color="white", alpha=0.35)
-
-        ax.set_yscale("log")
-        ax.invert_yaxis()
-        ax.set_ylabel("Period (days) [log scale]")
-        ax.set_xlabel("Year")
-        ax.set_title(f"CWT wavelet log-power (1998–2007): 95% red-noise significance; AR1={ar1:.2f}")
-        ax.legend(loc="upper right")
-        plt.tight_layout()
-        fig.savefig(outdir / "cwt_wavelet_logpower_1998_2007.png", dpi=300)
-        plt.close(fig)
-
-        # (2) Global wavelet spectrum: time-mean power vs period
-        global_power = np.nanmean(power, axis=1)
-        plt.figure(figsize=(6, 5))
-        plt.plot(global_power, period_days)
-        plt.yscale("log")
-        plt.gca().invert_yaxis()
-        plt.xlabel("Mean power")
-        plt.ylabel("Period (days) [log scale]")
-        plt.title("Global wavelet spectrum (1998–2007)")
-        save_fig(outdir / "cwt_global_spectrum_1998_2007.png")
-
-        # (3) Band-integrated power time series
+        # (1) Band-integrated power time series
         def bandpower(period_lo: float, period_hi: float) -> np.ndarray:
             band = (period_days >= period_lo) & (period_days <= period_hi)
             if not np.any(band):
@@ -694,15 +767,100 @@ def main(
         bp_event = bandpower(1.0, 7.0)
         bp_month = bandpower(20.0, 60.0)
 
-        plt.figure(figsize=(12, 4))
-        plt.plot(t, bp_event, label="Bandpower 1–7 days (event)")
-        plt.plot(t, bp_month, label="Bandpower 20–60 days (baseline)")
-        plt.axvspan(pd.Timestamp("2000-01-01"), pd.Timestamp("2005-12-31"), alpha=0.10, label="HF period")
-        plt.xlabel("Date")
-        plt.ylabel("Mean wavelet power")
-        plt.title("Band-integrated wavelet power time series (1998–2007)")
-        plt.legend(loc="best")
-        save_fig(outdir / "cwt_bandpower_timeseries_1998_2007.png")
+        # (2) Global wavelet spectrum: time-mean power vs period + AR(1) curves
+        global_power = np.nanmean(power, axis=1)
+
+        # ---- Faceted CWT figure (heatmap + global spectrum + bandpower series) ----
+        # Layout:
+        #   [heatmap] [global spectrum]
+        #   [bandpower time series    ]
+        fig = plt.figure(figsize=(13.8, 7.2))
+        gs = GridSpec(nrows=2, ncols=2, figure=fig, width_ratios=[5.0, 1.35], height_ratios=[3.0, 1.25])
+        ax_hm = fig.add_subplot(gs[0, 0])
+        ax_gs = fig.add_subplot(gs[0, 1], sharey=ax_hm)
+        ax_bp = fig.add_subplot(gs[1, 0], sharex=ax_hm)
+
+        # Heatmap
+        cmap = plt.get_cmap(CWT_CMAP).copy() if hasattr(plt.get_cmap(CWT_CMAP), "copy") else plt.get_cmap(CWT_CMAP)
+        try:
+            cmap.set_bad(CWT_MASK_BAD_RGBA)
+        except Exception:
+            pass
+        pcm = ax_hm.pcolormesh(
+            x_num,
+            period_days,
+            plot_log_power,
+            shading="auto",
+            cmap=cmap,
+            vmin=vmin,
+            vmax=vmax,
+        )
+        X, Y = np.meshgrid(x_num, period_days)
+        ax_hm.contour(X, Y, log_power - signif_log, levels=[0.0], linewidths=0.9)
+        mark_hf_period(ax_hm, HF_START, HF_END, label=None)
+        # Period guide lines
+        for _p in PERIOD_GUIDES_DAYS:
+            ax_hm.axhline(_p, **PERIOD_GUIDE_STYLE)
+        # Place HF label inside the heatmap around 2–3 days
+        add_hf_label_in_heatmap(ax_hm, HF_START, HF_END, y_period=2.5, text="HF period")
+
+        # Optional event-day guide lines (very light)
+        if "det_event_mask" in df_daily.columns:
+            evt = df_daily.loc["1998":"2007", "det_event_mask"]
+            evt_times = evt.index[evt.values.astype(bool)]
+            evt_x = mdates.date2num(evt_times.to_pydatetime())
+            for xx in evt_x:
+                ax_hm.axvline(float(xx), lw=0.25, alpha=0.18)
+
+        ax_hm.plot(x_num, coi_period, color="white", lw=1.0)
+        ax_hm.fill_between(x_num, coi_period, period_days.max(), color="white", alpha=0.35)
+        ax_hm.set_yscale("log")
+        ax_hm.invert_yaxis()
+        ax_hm.set_ylabel("Period (days) [log scale]")
+        ax_hm.xaxis.set_major_locator(mdates.YearLocator(1))
+        ax_hm.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+        ax_hm.set_xlabel("Year")
+        ax_hm.set_title(f"CWT wavelet log-power (1998–2007) with 95% red-noise significance; AR1={ar1:.2f}")
+        # Global spectrum panel (same y-axis as heatmap)
+        ax_gs.plot(global_power, period_days, lw=1.3)
+        ax_gs.plot(background, period_days, lw=1.0, ls="--", alpha=0.95)
+        ax_gs.plot(signif, period_days, lw=1.0, ls=":", alpha=0.95)
+        for _p in PERIOD_GUIDES_DAYS:
+            ax_gs.axhline(_p, **PERIOD_GUIDE_STYLE)
+        ax_gs.set_yscale("log")
+        ax_gs.invert_yaxis()
+        ax_gs.set_xlabel("Mean power")
+        ax_gs.set_title("Global\nspectrum")
+        ax_gs.grid(True, alpha=0.25)
+        # Keep the shared y formatting but hide duplicate labels
+        plt.setp(ax_gs.get_yticklabels(), visible=False)
+        ax_gs.tick_params(axis="y", which="both", length=0)
+        ax_gs.legend(["Mean", f"AR(1) bg (a={ar1:.2f})", "95% thr"], loc="lower right", frameon=False)
+
+        # Bandpower time series (aligned to heatmap x-axis)
+        ax_bp.plot(x_num, bp_event, color=COL["band_event"], label="Bandpower 1–7 days (event)")
+        ax_bp.plot(x_num, bp_month, color=COL["band_baseline"], label="Bandpower 20–60 days (baseline)")
+        mark_hf_span(ax_bp, HF_START, HF_END, label="HF period")
+        ax_bp.set_ylabel("Mean wavelet power")
+        ax_bp.set_xlabel("Date")
+        ax_bp.set_title("Band-integrated wavelet power time series")
+        ax_bp.xaxis.set_major_locator(mdates.YearLocator(1))
+        ax_bp.xaxis.set_major_formatter(mdates.DateFormatter("%Y"))
+        ax_bp.legend(loc="upper left")
+
+        # Inset horizontal colourbar on top of the heatmap (short, high-contrast)
+        from mpl_toolkits.axes_grid1.inset_locator import inset_axes
+        cax = inset_axes(ax_hm, width=CWT_COLORBAR["width"], height=CWT_COLORBAR["height"],
+                         loc=CWT_COLORBAR["loc"], borderpad=CWT_COLORBAR["borderpad"])
+        cbar = fig.colorbar(pcm, cax=cax, orientation="horizontal")
+        cbar.set_label(CWT_COLORBAR["label"], color=CWT_COLORBAR["label_color"])
+        cbar.ax.tick_params(axis="x", colors=CWT_COLORBAR["tick_color"], labelcolor=CWT_COLORBAR["tick_color"])
+        cbar.outline.set_edgecolor(CWT_COLORBAR["outline_color"])
+
+        # Save facet figure and also retain the original individual panels for convenience
+        fig.tight_layout(rect=[0, 0, 1, 0.96])
+        fig.savefig(outdir / "cwt_facet_1998_2007.png", dpi=300)
+        plt.close(fig)
 
     else:
         if progress:
@@ -746,52 +904,142 @@ def main(
     obs_hf = obs[(obs.index >= "2000-01-01") & (obs.index <= "2005-12-31")]
     obs_after = obs[obs.index > "2005-12-31"]
 
-    plt.plot(obs_before.index, obs_before.values, "o", ms=2.5, label="Observed (weekly)")
-    plt.plot(obs_hf.index, obs_hf.values, "-", lw=0.4, label="Observed (daily 2000–2005)")
-    plt.plot(obs_after.index, obs_after.values, "o", ms=2.5, label="Observed (weekly)")
+    plt.plot(
+        obs_before.index,
+        obs_before.values,
+        "o",
+        ms=2.5,
+        color=COL["obs_weekly"],
+        label="Observed (weekly)",
+    )
+    plt.plot(
+        obs_hf.index,
+        obs_hf.values,
+        "-",
+        lw=0.4,
+        color=COL["obs_daily"],
+        label="Observed (daily 2000–2005)",
+    )
+    plt.plot(
+        obs_after.index,
+        obs_after.values,
+        "o",
+        ms=2.5,
+        color=COL["obs_weekly"],
+        label="Observed (weekly)",
+    )
 
-    plt.plot(monthly_naive.index, monthly_naive["Mean"], "-", lw=1.2, label="Monthly naive mean")
-    plt.plot(monthly_censored.index, monthly_censored["Mean"], "--", lw=1.2, label="Monthly censored mean")
+    plt.plot(
+        monthly_naive.index,
+        monthly_naive["Mean"],
+        "-",
+        lw=1.2,
+        color=COL["naive"],
+        label="Monthly naive mean",
+    )
+    plt.plot(
+        monthly_censored.index,
+        monthly_censored["Mean"],
+        "--",
+        lw=1.2,
+        color=COL["censored"],
+        label="Monthly censored mean",
+    )
 
-    plt.axvspan(pd.Timestamp("2000-01-01"), pd.Timestamp("2005-12-31"), alpha=0.12, label="HF period")
+    plt.axvspan(HF_START, HF_END, alpha=0.12, label="HF period")
     plt.xlabel("Date")
     plt.ylabel("Total N (synthetic units)")
     plt.title("Raw observations vs monthly resampling (naive vs event-censored)")
     plt.legend(loc="best")
     save_fig(outdir / "raw_vs_monthly_naive_vs_censored.png")
 
-    # 2) Monthly CIs (1996–2008)
+    # 2) Monthly means with CIs (match wavelet period: 1998–2007) + CEEMDAN baseline
+    def _linear_trend(y: pd.Series) -> pd.Series:
+        yy = y.dropna()
+        if len(yy) < 3:
+            return y * np.nan
+        x = yy.index.map(pd.Timestamp.toordinal).to_numpy(dtype=float)
+        b1, b0 = np.polyfit(x, yy.to_numpy(dtype=float), 1)
+        x_all = y.index.map(pd.Timestamp.toordinal).to_numpy(dtype=float)
+        return pd.Series(b1 * x_all + b0, index=y.index)
+
     plt.figure(figsize=(11, 5))
-    m = monthly_naive.loc["1996":"2008"]
-    mc = monthly_censored.loc["1996":"2008"]
-    plt.plot(m.index, m["Mean"], "-", lw=1.3, label="Naive mean")
-    plt.fill_between(m.index, m["CI_Lo"], m["CI_Hi"], alpha=0.18, label="Naive 95% CI")
-    plt.plot(mc.index, mc["Mean"], "--", lw=1.3, label="Censored mean")
-    plt.fill_between(mc.index, mc["CI_Lo"], mc["CI_Hi"], alpha=0.18, label="Censored 95% CI")
-    plt.axvspan(pd.Timestamp("2000-01-01"), pd.Timestamp("2005-12-31"), alpha=0.10, label="HF period")
+    window = slice("1998", "2007")
+    m = monthly_naive.loc[window]
+    mc = monthly_censored.loc[window]
+    mce = monthly_ceemdan.loc[window]
+
+    plt.plot(m.index, m["Mean"], "-", lw=1.35, color=COL["naive"], label="Naive mean")
+    plt.fill_between(m.index, m["CI_Lo"], m["CI_Hi"], alpha=0.16, color=COL["naive"], label="Naive 95% CI")
+
+    plt.plot(mc.index, mc["Mean"], "--", lw=1.35, color=COL["censored"], label="Censored mean")
+    plt.fill_between(
+        mc.index,
+        mc["CI_Lo"],
+        mc["CI_Hi"],
+        alpha=0.16,
+        color=COL["censored"],
+        label="Censored 95% CI",
+    )
+
+    plt.plot(
+        mce.index,
+        mce["Mean"],
+        "-.",
+        lw=1.25,
+        color=COL["ceemdan"],
+        label="CEEMDAN baseline mean",
+    )
+
+    # Comparable trend lines (OLS) for naive vs censored
+    plt.plot(m.index, _linear_trend(m["Mean"]), ":", lw=1.1, color=COL["naive"], alpha=0.9, label="Naive trend")
+    plt.plot(
+        mc.index,
+        _linear_trend(mc["Mean"]),
+        ":",
+        lw=1.1,
+        color=COL["censored"],
+        alpha=0.9,
+        label="Censored trend",
+    )
+
+    plt.axvspan(HF_START, HF_END, alpha=0.10, label="HF period")
     plt.xlabel("Date")
     plt.ylabel("Total N (synthetic units)")
-    plt.title(f"Monthly means with confidence intervals (HF bias mean={bias_hf_mean:.3f})")
-    plt.legend(loc="best")
-    save_fig(outdir / "monthly_means_with_ci_1996_2008.png")
+    plt.title(f"Monthly means with confidence intervals (1998–2007; HF bias mean={bias_hf_mean:.3f})")
+    plt.legend(loc="best", ncol=2)
+    save_fig(outdir / "monthly_means_with_ci_1998_2007.png")
 
-    # 3) Event detection diagnostic (2002)
-    yr = "2002"
-    sel = df_daily.loc[yr]
+    # 3) Event detection diagnostic (full HF period)
+    sel = df_daily.loc[HF_START:HF_END]
     plt.figure(figsize=(11, 5))
-    plt.plot(sel.index, sel["true_with_spikes"], lw=0.8, label="Daily truth (with spikes)")
-    plt.plot(sel.index, sel["det_baseline_med31"], lw=1.2, label="Rolling median baseline (31d)")
+    plt.plot(
+        sel.index,
+        sel["true_with_spikes"],
+        lw=0.7,
+        color="0.25",
+        label="Daily truth (with spikes)",
+    )
+    plt.plot(
+        sel.index,
+        sel["det_baseline_med31"],
+        lw=1.2,
+        color=COL["baseline"],
+        label="Rolling median baseline (31d)",
+    )
     plt.scatter(
         sel.index[sel["det_event_mask"]],
         sel.loc[sel["det_event_mask"], "true_with_spikes"],
-        s=18,
+        s=10,
+        color=COL["events"],
         label="Detected events",
     )
+    plt.axvspan(HF_START, HF_END, alpha=0.08, label="HF period")
     plt.xlabel("Date")
     plt.ylabel("Total N (synthetic units)")
-    plt.title("Event detection (2002)")
+    plt.title("Event detection (2000–2005)")
     plt.legend(loc="best")
-    save_fig(outdir / "event_detection_2002.png")
+    save_fig(outdir / "event_detection_2000_2005.png")
 
     # 4) CEEMDAN IMFs (first 6) + reconstruction
     n_plot = min(6, imfs.shape[0])
@@ -813,12 +1061,19 @@ def main(
     # 5) Compare monthly baselines
     plt.figure(figsize=(11, 5))
     window = slice("1996", "2008")
-    plt.plot(monthly_naive.loc[window].index, monthly_naive.loc[window, "Mean"], lw=1.2, label="Naive monthly mean")
+    plt.plot(
+        monthly_naive.loc[window].index,
+        monthly_naive.loc[window, "Mean"],
+        lw=1.2,
+        color=COL["naive"],
+        label="Naive monthly mean",
+    )
     plt.plot(
         monthly_censored.loc[window].index,
         monthly_censored.loc[window, "Mean"],
         lw=1.2,
         ls="--",
+        color=COL["censored"],
         label="Event-censored monthly mean",
     )
     plt.plot(
@@ -826,9 +1081,10 @@ def main(
         monthly_ceemdan.loc[window, "Mean"],
         lw=1.2,
         ls="-.",
+        color=COL["ceemdan"],
         label="CEEMDAN baseline monthly mean",
     )
-    plt.axvspan(pd.Timestamp("2000-01-01"), pd.Timestamp("2005-12-31"), alpha=0.10, label="HF period")
+    plt.axvspan(HF_START, HF_END, alpha=0.10, label="HF period")
     plt.xlabel("Date")
     plt.ylabel("Total N (synthetic units)")
     plt.title("Monthly resampling approaches comparison")
@@ -869,4 +1125,3 @@ if __name__ == "__main__":
         ceemdan_noise_width=args.ceemdan_noise_width,
         skip_wavelet=args.skip_wavelet,
     )
-
